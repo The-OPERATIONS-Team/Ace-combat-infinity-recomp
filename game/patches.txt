@@ -1,0 +1,6 @@
+0x00110cdc 0x4bf979e1 guard if (ppu_acipatch(0)) ctx->r[3]=(uint64_t)1;
+0x00110d80 0x4bf97905 guard if (ppu_acipatch(0)) ctx->r[3]=(uint64_t)1;
+0x00111c80 0x4bfa71bd guard uint32_t _n; if (ppu_acipatch(&_n)) ctx->r[3]=(uint64_t)_n;
+0x00111da4 0x4bfa7109 guard uint32_t _n; if (ppu_acipatch(&_n)) ctx->r[3]=(uint64_t)_n;
+0x00115c04 0x4bf92add guard if (ppu_acipatch(0)) ctx->r[3]=(uint64_t)1;
+0x003ad5ec 0x83630018 replace ctx->r[27] = 0;
