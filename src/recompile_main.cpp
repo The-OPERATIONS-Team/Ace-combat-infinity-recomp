@@ -412,20 +412,34 @@ int main(int argc, char** argv){
     for (auto& mod : mods) discover_spu_elfs(mod, auto_spus);
     for (auto& a : auto_spus) W(F("spu_body_%s.c", a.fname.c_str()), a.src);
 
-    struct PrxSeg { std::string file; uint64_t vaddr, filesz; };
+    struct PrxSeg { std::string name; uint64_t vaddr, filesz; };
     std::vector<PrxSeg> prx_segs;
+    std::string segc = "#include <stdint.h>\n";
     for (size_t i=1;i<mods.size();++i){
         Mod& p = mods[i]; unsigned si=0;
         for (auto& s : p.elf.segments){
             if (s.type!=PT_LOAD || s.filesz==0) continue;
             const uint8_t* d = p.elf.at(s.vaddr, s.filesz);
             if (!d){ fprintf(stderr,"[%s] seg at 0x%llx unreadable\n",p.path.c_str(),(unsigned long long)s.vaddr); continue; }
-            std::string fn = F("prx%zu_seg%u.bin", i-1, si++);
-            std::ofstream f(out+"/"+fn, std::ios::binary);
+            std::string name = F("prx%zu_seg%u", i-1, si++);
+            std::ofstream f(out+"/"+name+".bin", std::ios::binary);
             f.write((const char*)d,(std::streamsize)s.filesz);
-            prx_segs.push_back({out+"/"+fn, s.vaddr, s.filesz});
+            segc += "const uint8_t " + name + "[] = {\n";
+            for (uint64_t k=0;k<s.filesz;k+=16){
+                for (uint64_t j=k;j<k+16 && j<s.filesz;++j) segc += F("0x%02x,", d[j]);
+                segc += "\n";
+            }
+            segc += "};\n";
+            prx_segs.push_back({name, s.vaddr, s.filesz});
         }
     }
+    segc += "typedef struct { const uint8_t* data; unsigned long long vaddr, size; } PrxSegData;\n";
+    segc += "const PrxSegData g_prx_segs[] = {\n";
+    for (auto& s : prx_segs)
+        segc += F("  {%s,0x%llxull,0x%llxull},\n", s.name.c_str(),
+                  (unsigned long long)s.vaddr,(unsigned long long)s.filesz);
+    segc += "  {0,0,0}\n};\n";
+    W("prx_segs.c", segc);
 
     {
         ElfImage& elf = mods[0].elf; PpuModule& m = mods[0].m;
@@ -434,7 +448,19 @@ int main(int argc, char** argv){
         uint32_t toc        = elf.r32(entry_opd+4) ? elf.r32(entry_opd+4) : m.module_toc;
         std::string c = "#include \"ppc_decls.h\"\n#include <stdio.h>\n#include <stdlib.h>\n#include <string.h>\n"
                         "#ifdef _WIN32\n#include <windows.h>\n#endif\n\n";
+        uint64_t elf_fnv = 0xcbf29ce484222325ull;
+        {
+            std::ifstream ef(in, std::ios::binary);
+            for (auto& s : elf.segments){
+                if (s.type!=PT_LOAD || !s.filesz || s.vaddr + s.filesz > 0x50000000ull) continue;
+                std::vector<uint8_t> buf((size_t)s.filesz);
+                ef.clear(); ef.seekg((std::streamoff)s.offset);
+                ef.read((char*)buf.data(), (std::streamsize)s.filesz);
+                for (uint8_t b : buf) { elf_fnv ^= b; elf_fnv *= 0x100000001b3ull; }
+            }
+        }
         c += "static const char* ELF_PATH = \"" + in + "\";\n";
+        c += F("static const unsigned long long ELF_FNV = 0x%llxull;\n", (unsigned long long)elf_fnv);
         c += "typedef struct { unsigned long long off,vaddr,filesz,memsz; } Seg;\n";
         c += "static const Seg SEGS[] = {\n";
         for (auto& s : elf.segments)
@@ -444,20 +470,44 @@ int main(int argc, char** argv){
                        (unsigned long long)s.filesz,(unsigned long long)s.memsz);
         c += "};\n";
         c += "static const unsigned NSEG = sizeof(SEGS)/sizeof(SEGS[0]);\n";
-        c += "typedef struct { const char* path; unsigned long long vaddr, filesz; } PrxSeg;\n";
-        c += "static const PrxSeg PRXSEGS[] = {\n";
-        for (auto& s : prx_segs)
-            c += F("  {\"%s\",0x%llxull,0x%llxull},\n", s.file.c_str(),
-                   (unsigned long long)s.vaddr,(unsigned long long)s.filesz);
-        c += "  {0,0,0}\n};\n";
+        c += "typedef struct { const uint8_t* data; unsigned long long vaddr, size; } PrxSegData;\n";
+        c += "extern const PrxSegData g_prx_segs[];\n";
         c += "typedef struct { uint32_t entry, toc; } PrxStart;\n";
         c += "static const PrxStart PRXSTART[] = {\n";
         for (auto& ms : module_starts) c += F("  {0x%x,0x%x},\n", ms.first, ms.second);
         c += "  {0,0}\n};\n";
         c += F("#define GUEST_SIZE 0x%llxull\n", 0x50000000ull);
         c += F("#define ENTRY 0x%xu\n#define TOCV 0x%xu\n", entry_code, toc);
-        c += R"(
+        c += R"MAIN(
 extern int g_cap_writewatch;
+
+static void boot_fail(const char* msg, const char* path){
+  fprintf(stderr, "%s\n%s\n", msg, path);
+#ifdef _WIN32
+  char b[1400];
+  snprintf(b, sizeof b, "%s\n\n%s", msg, path);
+  MessageBoxA(NULL, b, "Ace Combat Infinity (recomp)", MB_OK | MB_ICONERROR);
+#endif
+}
+
+static FILE* open_eboot(char* used, size_t n){
+  const char* e = getenv("PS3_EBOOT");
+  if(e && *e){ snprintf(used, n, "%s", e); return fopen(used, "rb"); }
+#ifdef _WIN32
+  char dir[MAX_PATH];
+  DWORD k = GetModuleFileNameA(NULL, dir, MAX_PATH);
+  char* s = (k && k < MAX_PATH) ? strrchr(dir, '\\') : NULL;
+  if(s){
+    *s = 0;
+    snprintf(used, n, "%s\\game\\EBOOT.ELF", dir);
+    FILE* f = fopen(used, "rb");
+    if(f) return f;
+  }
+#endif
+  FILE* f = fopen(ELF_PATH, "rb");
+  if(f){ snprintf(used, n, "%s", ELF_PATH); return f; }
+  return NULL;
+}
 
 int main(void){
 #ifdef _WIN32
@@ -473,20 +523,36 @@ int main(void){
   uint8_t* base = (uint8_t*)calloc(GUEST_SIZE,1);
 #endif
   if(!base){ fprintf(stderr,"alloc failed\n"); return 1; }
-  FILE* f = fopen(ELF_PATH,"rb");
-  if(!f){ fprintf(stderr,"open %s failed\n",ELF_PATH); return 1; }
+  char elf_path[1024] = "game\\EBOOT.ELF";
+  FILE* f = open_eboot(elf_path, sizeof elf_path);
+  if(!f){
+    boot_fail("EBOOT.ELF was not found. Put your decrypted EBOOT.ELF in the game folder next to game.exe.", elf_path);
+    return 1;
+  }
+  unsigned char magic[4] = {0};
+  if(fread(magic, 1, 4, f) != 4 || memcmp(magic, "\x7f" "ELF", 4) != 0){
+    fclose(f);
+    boot_fail(memcmp(magic, "SCE", 3) == 0
+              ? "EBOOT.ELF is still encrypted. Decrypt it first (RPCS3: Utilities > Decrypt PS3 Binaries)."
+              : "EBOOT.ELF is not a PS3 executable.", elf_path);
+    return 1;
+  }
+  unsigned long long h = 0xcbf29ce484222325ull;
+  int short_read = 0;
   for(unsigned i=0;i<NSEG;i++){
+    if (SEGS[i].vaddr + SEGS[i].filesz > GUEST_SIZE) continue;
     fseek(f, (long)SEGS[i].off, SEEK_SET);
-    if (SEGS[i].vaddr + SEGS[i].filesz <= GUEST_SIZE)
-      fread(base + SEGS[i].vaddr, 1, SEGS[i].filesz, f);
+    size_t got = fread(base + SEGS[i].vaddr, 1, SEGS[i].filesz, f);
+    if (got != SEGS[i].filesz) short_read = 1;
+    for (size_t k = 0; k < got; k++) { h ^= base[SEGS[i].vaddr + k]; h *= 0x100000001b3ull; }
   }
   fclose(f);
-  for(unsigned i=0;PRXSEGS[i].path;i++){
-    FILE* p = fopen(PRXSEGS[i].path,"rb");
-    if(!p){ fprintf(stderr,"open %s failed\n",PRXSEGS[i].path); return 1; }
-    fread(base + PRXSEGS[i].vaddr, 1, PRXSEGS[i].filesz, p);
-    fclose(p);
+  if(short_read || h != ELF_FNV){
+    boot_fail("This EBOOT.ELF is not the game version this build was made for.", elf_path);
+    return 1;
   }
+  for(unsigned i=0;g_prx_segs[i].data;i++)
+    memcpy(base + g_prx_segs[i].vaddr, g_prx_segs[i].data, g_prx_segs[i].size);
   ppu_rt_init(base, GUEST_SIZE);
   PPUContext ctx; memset(&ctx,0,sizeof ctx);
   ctx.r[1] = GUEST_SIZE - 0x100000;
@@ -505,7 +571,7 @@ int main(void){
   printf("[exit] r3=%llu (0x%llx)\n",(unsigned long long)ctx.r[3],(unsigned long long)ctx.r[3]);
   return 0;
 }
-)";
+)MAIN";
         W("ppc_main.c", c);
     }
 

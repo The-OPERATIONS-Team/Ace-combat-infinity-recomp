@@ -99,9 +99,9 @@ def main():
     mem = Memory()
     for va, data in load_segments(open(a.eboot, "rb").read(), a.eboot):
         mem.add(va, data)
-    main_c = open(os.path.join(out, "ppc_main.c")).read()
-    for path, va in re.findall(r'\{"([^"]+)",0x([0-9a-f]+)ull,0x[0-9a-f]+ull\}', main_c):
-        mem.add(int(va, 16), open(path, "rb").read())
+    segs_c = open(os.path.join(out, "prx_segs.c")).read()
+    for name, va in re.findall(r'\{(prx\d+_seg\d+),0x([0-9a-f]+)ull,0x[0-9a-f]+ull\}', segs_c):
+        mem.add(int(va, 16), open(os.path.join(out, name + ".bin"), "rb").read())
 
     images = []
     reloc = {}

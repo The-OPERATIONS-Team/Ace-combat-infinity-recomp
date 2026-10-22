@@ -26,6 +26,7 @@ gen/ppc_*.c
 gen/ppc_decls.h
 gen/spu_body_*.c
 gen/spu_reloc_imgs.c
+gen/prx_segs.c
 gen/*.txt
 !gen/CMakeLists.txt
 data/

@@ -68,7 +68,7 @@ python tools/generate.py --eboot C:\path\to\EBOOT.ELF --libsre C:\path\to\libsre
 
 This recompiles the PPU code of the game and both firmware modules, applies the offline patches from `game/patches.txt`, and lifts the SPU jobs listed in `game/spu_lifts.csv`. It takes under a minute and writes everything into `gen/`.
 
-The EBOOT path is stored in the build and the game loads it at startup, so leave `EBOOT.ELF` where it is.
+The game reads `EBOOT.ELF` at startup. It looks in a `game` folder next to `game.exe` first and then at the path you gave the generator, so either leave the file where it is or copy it to `gen\build\game\EBOOT.ELF`.
 
 ### 3. Build the game
 
@@ -81,14 +81,16 @@ This is the long step: around 10 to 15 minutes on a 12-thread CPU. The SPU job f
 
 ## Running
 
-Point `PS3_FS_ROOT` at the game's `USRDIR` folder and start the exe:
+If you downloaded a release, follow the `README.txt` that comes with it. You only need your decrypted `EBOOT.ELF` and the game's `USRDIR` folder.
+
+For your own build, point `PS3_FS_ROOT` at the game's `USRDIR` folder and start the exe:
 
 ```
 set PS3_FS_ROOT=C:\path\to\NPUB31347\USRDIR
 gen\build\game.exe 2> game.log
 ```
 
-The runtime writes a lot of diagnostics to stderr, so redirect it to a file.
+Without `PS3_FS_ROOT` the game uses `game\USRDIR` next to `game.exe`. The runtime writes a lot of diagnostics to stderr, so redirect it to a file.
 
 Controllers work through XInput and SDL3, so Xbox pads and a DualShock 4 both work. On the keyboard:
 

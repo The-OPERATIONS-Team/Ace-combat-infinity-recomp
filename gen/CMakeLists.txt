@@ -174,6 +174,7 @@ add_executable(game
   spu_body_spu_job_c91780_s2c800.c
   spu_body_spu_job_c91780_s2cc00.c
   spu_reloc_imgs.c
+  prx_segs.c
   spu_bodies.c
   ppc_func_000.c
   ppc_func_001.c

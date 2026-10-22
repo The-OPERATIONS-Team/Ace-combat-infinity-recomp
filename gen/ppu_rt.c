@@ -1824,7 +1824,13 @@ static char g_fs_root[512] = "";
 static const char* fs_root(void){
     if(g_fs_root[0]) return g_fs_root;
     const char* e=getenv("PS3_FS_ROOT");
-    snprintf(g_fs_root,sizeof g_fs_root,"%s",(e&&*e)?e:"./vfs");
+    if(e&&*e){ snprintf(g_fs_root,sizeof g_fs_root,"%s",e); return g_fs_root; }
+    { char dir[MAX_PATH]; DWORD k=GetModuleFileNameA(NULL,dir,MAX_PATH);
+      char* s=(k&&k<MAX_PATH)?strrchr(dir,'\\'):NULL;
+      if(s){ *s=0; snprintf(g_fs_root,sizeof g_fs_root,"%s\\game\\USRDIR",dir);
+             DWORD a=GetFileAttributesA(g_fs_root);
+             if(a!=INVALID_FILE_ATTRIBUTES&&(a&FILE_ATTRIBUTE_DIRECTORY)) return g_fs_root; } }
+    snprintf(g_fs_root,sizeof g_fs_root,"%s","./vfs");
     return g_fs_root;
 }
 static void fs_guest_str(uint8_t* base, uint32_t ea, char* out, size_t n){
