@@ -70,6 +70,17 @@ static int create_swapchain(void){
     uint32_t nimg = caps.minImageCount+1;
     if(caps.maxImageCount && nimg>caps.maxImageCount) nimg=caps.maxImageCount;
 
+    VkPresentModeKHR pm=VK_PRESENT_MODE_FIFO_KHR;
+    { uint32_t npm=0; VkPresentModeKHR pms[16];
+      vkGetPhysicalDeviceSurfacePresentModesKHR(g_pdev,g_surf,&npm,NULL);
+      if(npm>16) npm=16;
+      vkGetPhysicalDeviceSurfacePresentModesKHR(g_pdev,g_surf,&npm,pms);
+      VkPresentModeKHR want=VK_PRESENT_MODE_MAILBOX_KHR;
+      const char* e=getenv("PS3_PRESENT");
+      if(e&&!_stricmp(e,"fifo")) want=VK_PRESENT_MODE_FIFO_KHR;
+      if(e&&!_stricmp(e,"immediate")) want=VK_PRESENT_MODE_IMMEDIATE_KHR;
+      for(uint32_t i=0;i<npm;i++) if(pms[i]==want) pm=want; }
+
     VkSwapchainKHR old=g_swap;
     VkSwapchainCreateInfoKHR sci={ .sType=VK_STRUCTURE_TYPE_SWAPCHAIN_CREATE_INFO_KHR,
         .surface=g_surf, .minImageCount=nimg, .imageFormat=pick.format,
@@ -78,7 +89,7 @@ static int create_swapchain(void){
         .imageSharingMode=VK_SHARING_MODE_EXCLUSIVE,
         .preTransform=caps.currentTransform,
         .compositeAlpha=VK_COMPOSITE_ALPHA_OPAQUE_BIT_KHR,
-        .presentMode=VK_PRESENT_MODE_FIFO_KHR, .clipped=VK_TRUE, .oldSwapchain=old };
+        .presentMode=pm, .clipped=VK_TRUE, .oldSwapchain=old };
     VKCHK(vkCreateSwapchainKHR(g_dev,&sci,NULL,&g_swap));
     if(old) vkDestroySwapchainKHR(g_dev,old,NULL);
     g_swap_fmt=pick.format; g_swap_ext=ext;
@@ -106,8 +117,10 @@ static int create_swapchain(void){
         VKCHK(vkCreateSemaphore(g_dev,&semci,NULL,&g_sem_acq[i]));
     for(uint32_t i=0;i<g_swap_n;i++)
         VKCHK(vkCreateSemaphore(g_dev,&semci,NULL,&g_sem_done[i]));
-    fprintf(stderr,"[RSXVK] swapchain %ux%u fmt=%d n=%u\n",
-            ext.width,ext.height,(int)g_swap_fmt,g_swap_n);
+    fprintf(stderr,"[RSXVK] swapchain %ux%u fmt=%d n=%u present=%s\n",
+            ext.width,ext.height,(int)g_swap_fmt,g_swap_n,
+            pm==VK_PRESENT_MODE_MAILBOX_KHR?"mailbox":
+            pm==VK_PRESENT_MODE_IMMEDIATE_KHR?"immediate":"fifo");
     return 1;
 }
 

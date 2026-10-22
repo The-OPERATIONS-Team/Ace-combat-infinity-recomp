@@ -17,13 +17,13 @@ static uint8_t*  g_main = 0;
 static uint64_t  g_mainsz = 0;
 #pragma comment(lib, "winmm")
 #pragma comment(lib, "synchronization")
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 
 static SpuThread* g_all_thr[16]; static volatile long g_all_n;
 static void lockline_lost(uint32_t line, const SpuThread* by);
-static void lockline_wake(uint32_t ea){
-    if(g_main && (uint64_t)(ea & ~127u) + 128 <= g_mainsz)
-        WakeByAddressAll(g_main + (ea & ~127u));
-}
+static void lockline_wake(uint32_t ea);
 static void spu_statecap(const char* dir);
 void spu_rt_set_mainmem(uint8_t* base, uint64_t size){
     g_main = base; g_mainsz = size;
@@ -48,7 +48,8 @@ struct SpuThread {
     uint32_t   resv_ea; uint8_t resv_data[128]; int resv_valid;
     uint32_t   atomic_stat;
     int32_t    poll_tokens;
-    uint32_t   poll_refill_ms;
+    int64_t    poll_refill_q;
+    HANDLE     wake_evt, hrt;
     SpdLlNew   ll;
     SpdCh      rc;
     uint32_t   slot;
@@ -96,7 +97,13 @@ enum {
 static SpuThread* self(SPUContext* c){ return (SpuThread*)c->spu; }
 
 #define ATOM_STRIPES SPD_STRIPES_NEW
-typedef struct { SRWLOCK lk; char pad[64 - sizeof(SRWLOCK)]; } AtomStripe;
+typedef struct {
+    SRWLOCK       lk;
+    volatile LONG seq;
+    volatile LONG parked;
+    volatile LONG nwao;
+    char pad[64 - sizeof(SRWLOCK) - 3 * sizeof(LONG)];
+} AtomStripe;
 static __declspec(align(64)) AtomStripe g_atom_srw[ATOM_STRIPES];
 static CRITICAL_SECTION g_pm_lock;
 static volatile long g_atomic_lock_init;
@@ -115,57 +122,129 @@ static void atomic_lock_init(void){
         InterlockedExchange(&state,2);
     } else while(state!=2) SwitchToThread();
 }
-static SRWLOCK* atom_srw(uint32_t ea){
-    return &g_atom_srw[spd_stripe_new(ea)].lk;
+static AtomStripe* atom_stripe(uint32_t ea){
+    return &g_atom_srw[spd_stripe_new(ea)];
+}
+static inline void atom_write_begin(AtomStripe* st){ InterlockedIncrement(&st->seq); }
+static inline void atom_write_end(AtomStripe* st){ InterlockedIncrement(&st->seq); }
+static LONG atom_seq_even(AtomStripe* st){
+    for(int spin = 0;; spin++){
+        LONG s = __atomic_load_n(&st->seq, __ATOMIC_ACQUIRE);
+        if(!(s & 1)) return s;
+        if(spin < 64){ YieldProcessor(); continue; }
+        AcquireSRWLockShared(&st->lk); ReleaseSRWLockShared(&st->lk);
+        spin = 0;
+    }
+}
+static inline int atom_seq_same(AtomStripe* st, LONG s){
+    __atomic_thread_fence(__ATOMIC_ACQUIRE);
+    return __atomic_load_n(&st->seq, __ATOMIC_RELAXED) == s;
+}
+
+static void spu_timed_wait(SpuThread* t, HANDLE evt, uint32_t us){
+    if(!t->hrt){
+        DWORD ms = (us + 999) / 1000;
+        if(evt) WaitForSingleObject(evt, ms); else Sleep(ms);
+        return;
+    }
+    LARGE_INTEGER due; due.QuadPart = -(LONGLONG)us * 10;
+    SetWaitableTimer(t->hrt, &due, 0, NULL, NULL, FALSE);
+    if(evt){ HANDLE hs[2] = { evt, t->hrt }; WaitForMultipleObjects(2, hs, FALSE, INFINITE); }
+    else WaitForSingleObject(t->hrt, INFINITE);
+}
+
+static volatile uint32_t g_fifo_watch;
+static HANDLE g_fifo_evt;
+void spu_fifo_watch_event(void* evt){ g_fifo_evt = (HANDLE)evt; }
+void spu_fifo_watch(uint32_t ea){ g_fifo_watch = ea & ~127u; }
+
+static void lockline_wake(uint32_t ea){
+    uint32_t line = ea & ~127u;
+    if(!g_main || (uint64_t)line + 128 > g_mainsz) return;
+    AtomStripe* st = atom_stripe(line);
+    InterlockedExchangeAdd(&st->seq, 2);
+    LONG m = st->parked;
+    while(m){
+        SpuThread* u = g_all_thr[__builtin_ctz((unsigned)m)];
+        m &= m - 1;
+        if(u && u->wake_evt) SetEvent(u->wake_evt);
+    }
+    if(st->nwao) WakeByAddressAll((void*)&st->seq);
+    if(g_fifo_watch == line && g_fifo_evt) SetEvent(g_fifo_evt);
+}
+
+static void lockline_park(SpuThread* t, AtomStripe* st, LONG seen, uint32_t us){
+    if(t->wake_evt && t->slot < 16){
+        LONG bit = 1L << t->slot;
+        InterlockedOr(&st->parked, bit);
+        if(st->seq == seen) spu_timed_wait(t, t->wake_evt, us);
+        InterlockedAnd(&st->parked, ~bit);
+    } else {
+        InterlockedIncrement(&st->nwao);
+        if(st->seq == seen) WaitOnAddress((void*)&st->seq, &seen, sizeof seen, (us + 999) / 1000);
+        InterlockedDecrement(&st->nwao);
+    }
+}
+
+static LONG lockline_snapshot(SpuThread* t, AtomStripe* st, uint32_t cea, uint8_t* lsl){
+    for(;;){
+        LONG s = atom_seq_even(st);
+        memcpy(lsl, g_main + cea, 128);
+        memcpy(t->resv_data, lsl, 128);
+        t->resv_ea = cea; t->resv_valid = 1;
+        MemoryBarrier();
+        if(atom_seq_same(st, s)) return s;
+    }
 }
 
 uint32_t ppu_lwarx(PPUContext* ctx, uint8_t* base, uint32_t ea){
     atomic_lock_init();
-    SRWLOCK* cs = atom_srw(ea);
-    AcquireSRWLockShared(cs);
-    uint32_t raw; memcpy(&raw, base+ea, 4);
-    ReleaseSRWLockShared(cs);
+    AtomStripe* st = atom_stripe(ea);
+    uint32_t raw; LONG s;
+    do { s = atom_seq_even(st); memcpy(&raw, base+ea, 4); } while(!atom_seq_same(st, s));
     ctx->reserve_addr=ea; ctx->reserve_value=raw; ctx->reserve_valid=1;
     return __builtin_bswap32(raw);
 }
 uint64_t ppu_ldarx(PPUContext* ctx, uint8_t* base, uint32_t ea){
     atomic_lock_init();
-    SRWLOCK* cs = atom_srw(ea);
-    AcquireSRWLockShared(cs);
-    uint64_t raw; memcpy(&raw, base+ea, 8);
-    ReleaseSRWLockShared(cs);
+    AtomStripe* st = atom_stripe(ea);
+    uint64_t raw; LONG s;
+    do { s = atom_seq_even(st); memcpy(&raw, base+ea, 8); } while(!atom_seq_same(st, s));
     ctx->reserve_addr=ea; ctx->reserve_value=raw; ctx->reserve_valid=1;
     return __builtin_bswap64(raw);
 }
 void ppu_stwcx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint32_t v){
     atomic_lock_init();
     int ok=0;
-    SRWLOCK* cs = atom_srw(ea);
-    AcquireSRWLockExclusive(cs);
+    AtomStripe* st = atom_stripe(ea);
+    AcquireSRWLockExclusive(&st->lk);
     if(ctx->reserve_valid){
         uint32_t cur; memcpy(&cur, base+ea, 4);
-        if(cur==(uint32_t)ctx->reserve_value){ uint32_t want=__builtin_bswap32(v); memcpy(base+ea,&want,4); ok=1; }
+        if(cur==(uint32_t)ctx->reserve_value){ uint32_t want=__builtin_bswap32(v);
+            atom_write_begin(st); memcpy(base+ea,&want,4); atom_write_end(st); ok=1; }
     }
-    ReleaseSRWLockExclusive(cs);
+    ReleaseSRWLockExclusive(&st->lk);
     if(ok){ lockline_lost(ea & ~127u, 0); lockline_wake(ea); }
     ctx->reserve_valid=0; ctx->cr[0]=(uint8_t)((ok?2:0)|(ctx->so?1:0));
 }
 void ppu_stdcx(PPUContext* ctx, uint8_t* base, uint32_t ea, uint64_t v){
     atomic_lock_init();
     int ok=0;
-    SRWLOCK* cs = atom_srw(ea);
-    AcquireSRWLockExclusive(cs);
+    AtomStripe* st = atom_stripe(ea);
+    AcquireSRWLockExclusive(&st->lk);
     if(ctx->reserve_valid){
         uint64_t cur; memcpy(&cur, base+ea, 8);
-        if(cur==ctx->reserve_value){ uint64_t want=__builtin_bswap64(v); memcpy(base+ea,&want,8); ok=1; }
+        if(cur==ctx->reserve_value){ uint64_t want=__builtin_bswap64(v);
+            atom_write_begin(st); memcpy(base+ea,&want,8); atom_write_end(st); ok=1; }
     }
-    ReleaseSRWLockExclusive(cs);
+    ReleaseSRWLockExclusive(&st->lk);
     if(ok){ lockline_lost(ea & ~127u, 0); lockline_wake(ea); }
     ctx->reserve_valid=0; ctx->cr[0]=(uint8_t)((ok?2:0)|(ctx->so?1:0));
 }
 
 #define POLL_CAP   4096
-#define POLL_RATE  1024
+#define POLL_RATE  256
+#define POLL_WAIT_US 250
 static void spu_poll_work(SpuThread* t){
     t->poll_tokens = POLL_CAP; t->ll.idle = 0; t->rc.n = 0;
     PTRC(t->slot, PT_WORK, 0, 0);
@@ -174,26 +253,30 @@ static void spu_poll_work(SpuThread* t){
 static void spu_poll_read(SpuThread* t, uint32_t ea, uint32_t sz){
     (void)ea;
     static int nopace = -1;
-    static int rate = -1, pyield = -1;
+    static int rate = -1, pyield = -1, wait_us;
+    static int64_t qpf;
     if(nopace < 0){
         nopace = getenv("PS3_SPU_NOPACE") ? 1 : 0;
         const char* r = getenv("PS3_SPU_POLLRATE");
         rate = (r && atoi(r) > 0) ? atoi(r) : POLL_RATE;
+        r = getenv("PS3_SPU_POLLWAIT_US");
+        wait_us = (r && atoi(r) > 0) ? atoi(r) : POLL_WAIT_US;
         pyield = getenv("PS3_SPU_POLLYIELD") ? 1 : 0;
+        LARGE_INTEGER f; QueryPerformanceFrequency(&f); qpf = f.QuadPart;
     }
     if(nopace) return;
     if(sz > 512){ spu_poll_work(t); return; }
-    DWORD now = GetTickCount();
-    if(now != t->poll_refill_ms){
-        DWORD dt = now - t->poll_refill_ms;
-        t->poll_refill_ms = now;
-        int32_t add = (dt > 64) ? POLL_CAP : (int32_t)dt * rate;
-        t->poll_tokens = (t->poll_tokens > POLL_CAP - add) ? POLL_CAP : t->poll_tokens + add;
-    }
-    if(--t->poll_tokens < 0){ t->poll_tokens = 0;
-        uint64_t tb=spuprof_now();
-        if(pyield) SwitchToThread(); else Sleep(1);
-        spuprof_blocked(tb); }
+    if(--t->poll_tokens >= 0) return;
+    LARGE_INTEGER q; QueryPerformanceCounter(&q);
+    int64_t dt = q.QuadPart - t->poll_refill_q;
+    t->poll_refill_q = q.QuadPart;
+    int64_t add = (dt >= qpf / 16) ? POLL_CAP : dt * rate * 1000 / qpf;
+    if(add > POLL_CAP) add = POLL_CAP;
+    if(add > 0){ t->poll_tokens = (int32_t)add - 1; return; }
+    t->poll_tokens = 0;
+    uint64_t tb=spuprof_now();
+    if(pyield) SwitchToThread(); else spu_timed_wait(t, NULL, (uint32_t)wait_us);
+    spuprof_blocked(tb);
 }
 
 static void lswatch(SpuThread* t, uint32_t op, uint32_t lsa, uint32_t ea, uint32_t sz){
@@ -383,6 +466,8 @@ static void mfc_list_run(SpuThread* t){
                 tbl_put(t,"PUTL",eal,esz,t->ls+cur_ls);
                 if(!mfc_drop(eal,esz))
                 memcpy(g_main+eal, t->ls+cur_ls, esz);
+                if(esz <= 2048)
+                    for(uint32_t l = eal & ~127u; l < eal + esz; l += 128) lockline_wake(l);
             }
         }
         t->lstall.cur_ls += (esz+15)&~15u;
@@ -449,36 +534,31 @@ static void mfc_do(SpuThread* t, uint32_t cmd){
                   for(int i=0;i<ns && n<(int)sizeof b-32;i++)
                       n+=snprintf(b+n,sizeof b-n," 0x%x=%ld",seen[i],cnt[i]);
                   fprintf(stderr,"%.*s\n",(int)sizeof b,b); } } }
-        SRWLOCK* cs = atom_srw(cea);
+        AtomStripe* st = atom_stripe(cea);
+        uint8_t* lsl = t->ls + (lsa&~127u);
+        LONG seen;
         { uint64_t tl=spuprof_now();
-          AcquireSRWLockShared(cs);
+          seen = lockline_snapshot(t, st, cea, lsl);
           spuprof_lock(tl); }
-        memcpy(t->ls + (lsa&~127u), g_main + cea, 128);
-        { static int yat=-1, pat;
+        { static int yat=-1, pat, park_us;
           if(yat<0){ const char* e=getenv("PS3_SPU_LLYIELD");
                      yat = e ? atoi(e) : 16;
                      e = getenv("PS3_SPU_LLPARK");
-                     pat = e ? atoi(e) : 64; }
-          uint64_t tag = spd_tag128(g_main + cea);
+                     pat = e ? atoi(e) : 64;
+                     e = getenv("PS3_SPU_LLPARK_US");
+                     park_us = (e && atoi(e) > 0) ? atoi(e) : 1000; }
+          uint64_t tag = spd_tag128(lsl);
           uint32_t idle = spd_ll_new(&t->ll, cea, tag);
           PTRC(t->slot, PT_GETLLAR, cea, (uint32_t)tag);
           if(yat > 0 && idle >= (uint32_t)yat){
-              ReleaseSRWLockShared(cs);
               uint64_t tb=spuprof_now();
-              if(pat > 0 && idle >= (uint32_t)pat){
-                  unsigned long long cap;
-                  memcpy(&cap, g_main+cea, 8);
-                  WaitOnAddress(g_main+cea, &cap, 8, 1);
-              } else SwitchToThread();
+              if(pat > 0 && idle >= (uint32_t)pat) lockline_park(t, st, seen, (uint32_t)park_us);
+              else SwitchToThread();
               spuprof_blocked(tb);
-              AcquireSRWLockShared(cs);
-              memcpy(t->ls + (lsa&~127u), g_main + cea, 128);
-              spd_ll_new(&t->ll, cea, spd_tag128(g_main + cea));
+              seen = lockline_snapshot(t, st, cea, lsl);
+              spd_ll_new(&t->ll, cea, spd_tag128(lsl));
           } }
         tbl_get(t,"GETLLAR",cea,128);
-        memcpy(t->resv_data, g_main + cea, 128);
-        t->resv_ea = cea; t->resv_valid = 1;
-        ReleaseSRWLockShared(cs);
         t->atomic_stat |= MFC_GETLLAR_SUCCESS;
         t->mfc_size = 0; return;
     }
@@ -487,17 +567,19 @@ static void mfc_do(SpuThread* t, uint32_t cmd){
         int ok = 0;
         PTRC(t->slot, PT_PUTLLC, cea, 1);
         if(cea+128<=g_mainsz && t->resv_valid && t->resv_ea==cea){
-            SRWLOCK* cs = atom_srw(cea);
-            AcquireSRWLockExclusive(cs);
+            AtomStripe* st = atom_stripe(cea);
+            AcquireSRWLockExclusive(&st->lk);
             if(memcmp(g_main+cea, t->resv_data, 128)==0){
                 const uint8_t* lsrc = t->ls + (lsa&~127u);
                 uint8_t* dst = g_main + cea;
                 tbl_put(t,"PUTLLC",cea,128,lsrc);
+                atom_write_begin(st);
                 for(int i=0;i<128;i++)
                     if(lsrc[i]!=t->resv_data[i]) dst[i]=lsrc[i];
+                atom_write_end(st);
                 ok=1;
             }
-            ReleaseSRWLockExclusive(cs);
+            ReleaseSRWLockExclusive(&st->lk);
         }
         if(!ok){ tbl_init();
             if(g_tbl_hi && cea<g_tbl_hi && cea+128>g_tbl_lo){
@@ -524,11 +606,13 @@ static void mfc_do(SpuThread* t, uint32_t cmd){
     case 0xb0: case 0xb8: {
         uint32_t cea = ea & ~127u;
         if(cea+128<=g_mainsz){
-            SRWLOCK* cs = atom_srw(cea);
-            AcquireSRWLockExclusive(cs);
+            AtomStripe* st = atom_stripe(cea);
+            AcquireSRWLockExclusive(&st->lk);
             tbl_put(t,"PUTLLUC",cea,128,t->ls+(lsa&~127u));
+            atom_write_begin(st);
             memcpy(g_main+cea, t->ls + (lsa&~127u), 128);
-            ReleaseSRWLockExclusive(cs);
+            atom_write_end(st);
+            ReleaseSRWLockExclusive(&st->lk);
             lockline_lost(cea, t); lockline_wake(cea);
         }
         t->atomic_stat |= MFC_PUTLLUC_SUCCESS;
@@ -1190,6 +1274,9 @@ SpuThread* spu_thread_alloc(void){
     t->ls = (uint8_t*)calloc(1,0x40000);
     t->ctx.ls = t->ls; t->ctx.lsmask = SPU_LSMASK; t->ctx.spu = t;
     InitializeCriticalSection(&t->lock); InitializeConditionVariable(&t->cv);
+    t->wake_evt = CreateEventW(NULL, FALSE, FALSE, NULL);
+    t->hrt = CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                    TIMER_ALL_ACCESS);
     { long i=InterlockedIncrement(&g_all_n)-1; if(i<16) g_all_thr[i]=t;
       t->slot = (uint32_t)i;
       if(i==0 && getenv("PS3_SPUMON")) CreateThread(0,0,spu_monitor,0,0,0); }

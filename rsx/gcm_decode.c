@@ -8,6 +8,7 @@
 
 RsxState g_rsx;
 uint32_t g_vp_const_epoch;
+uint32_t g_vp_instr_epoch;
 
 #include "gcm_method_names.inl"
 #define NNAMES (sizeof gcm_method_names / sizeof gcm_method_names[0])
@@ -70,7 +71,7 @@ void rsx_method(uint32_t m, uint32_t arg){
 
     if(m>=0x0b80&&m<0x0c00){
         uint32_t w=s->vp_cursor;
-        if(w<512*4){ s->vp_instr[w>>2][w&3]=arg; }
+        if(w<512*4){ s->vp_instr[w>>2][w&3]=arg; g_vp_instr_epoch++; }
         s->vp_cursor=w+1; return;
     }
     if(m>=0x1f00&&m<0x1f80){
@@ -176,7 +177,9 @@ void rsx_method(uint32_t m, uint32_t arg){
     case 0x031c: s->blend_color=arg; break;
     case 0x0320: s->blend_eq=arg; break;
     case 0x0324: s->color_mask=arg;
-        { static long cmn; if(getenv("PS3_RSX_CMASKDBG")&&++cmn<=64)
+        { static long cmn; static int on=-1;
+          if(on<0) on=getenv("PS3_RSX_CMASKDBG")?1:0;
+          if(on&&++cmn<=64)
             fprintf(stderr,"[GCMDEC] color_mask=0x%08x\n",arg); }
         break;
     case 0x0328: s->stencil_test=arg; break;

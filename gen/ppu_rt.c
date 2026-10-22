@@ -19,6 +19,9 @@
 #include <xinput.h>
 #include <math.h>
 #pragma comment(lib, "xinput9_1_0")
+#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
+#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
+#endif
 #endif
 
 static uint8_t*  g_base = 0;
@@ -2071,9 +2074,10 @@ static void jobfp_read(const uint8_t* ls, uint32_t base, uint8_t* fp){
     memcpy(fp + 0x2c, ls + base + 0x60, 0x100);
 }
 int spu_jobbody_verify(void (*fn)(SPUContext*), const uint8_t* ls, uint32_t base){
-    uint32_t ea = 0;
+    uint32_t ea = 0, code_end = 0;
     for (unsigned i = 0; i < g_spu_njob_guest; i++)
-        if (g_spu_job_guest[i].fn == fn){ ea = g_spu_job_guest[i].ea; break; }
+        if (g_spu_job_guest[i].fn == fn){ ea = g_spu_job_guest[i].ea;
+                                          code_end = g_spu_job_guest[i].code_end; break; }
     if (!ea) return 1;
     if (base + 0x160 > 0x40000 || memcmp(ls + base + 0x30, "JOBCRT", 6) != 0) return 1;
     {
@@ -2097,6 +2101,7 @@ int spu_jobbody_verify(void (*fn)(SPUContext*), const uint8_t* ls, uint32_t base
                       g_base[ea+0x42]<<8 | g_base[ea+0x43];
         if (gi >= 0x80 && gi <= gt && gt <= 0x30000 && head > gi) head = gi;
         else if (gt >= 0x80 && gt <= 0x30000 && head > gt) head = gt; }
+    if (code_end >= 0x80 && head > code_end + 0x10) head = code_end + 0x10;
     if ((uint64_t)ea + head > g_size) return 0;
     {
         int ok = memcmp(ls + base, g_base + ea, 0x20) == 0 &&
@@ -2182,10 +2187,31 @@ static uint32_t spu_body_hi(unsigned i){
     if (i < 256) g_body_hi[i] = hi;
     return hi;
 }
+static uint32_t g_body_ea[256];
+static uint32_t spu_body_ea(unsigned i){
+    if (i < 256 && g_body_ea[i]) return g_body_ea[i] == 1 ? 0 : g_body_ea[i];
+    uint32_t ea = 0;
+    for (unsigned k = 0; k < g_spu_njob_guest; k++)
+        if (g_spu_job_guest[k].fn == g_spu_bodies[i].fn){ ea = g_spu_job_guest[k].ea; break; }
+    if (i < 256) g_body_ea[i] = ea ? ea : 1;
+    return ea;
+}
+static int spu_job_staged_inside(unsigned i, uint32_t base, uint32_t pc, const uint8_t* ls){
+    uint32_t ea = spu_body_ea(i);
+    if (!ea) return 0;
+    for (uint32_t s = base + 0x400; s <= pc && s + 0x36 <= 0x40000; s += 0x400){
+        if (memcmp(ls + s + 0x30, "JOBCRT", 6) != 0) continue;
+        uint64_t own = (uint64_t)ea + (s - base) + 0x30;
+        if (own + 6 <= g_size && memcmp(g_base + own, "JOBCRT", 6) == 0) continue;
+        return 1;
+    }
+    return 0;
+}
 int spu_body_accept(unsigned i, uint32_t pc, const uint8_t* ls){
     const SpuBody* b = &g_spu_bodies[i];
     if (!b->range || pc < b->range[0] || pc >= spu_body_hi(i)) return 0;
     if (!b->sig || !b->sig_at || memcmp(ls + *b->sig_at, b->sig, 16) != 0) return 0;
+    if (b->entry == b->range[0] && spu_job_staged_inside(i, b->range[0], pc, ls)) return 0;
     if (b->entry == b->range[0] && !spu_jobbody_verify(b->fn, ls, b->range[0])) return 0;
     if (!spu_elfbody_ok(b->fn, ls)) return 0;
     if (!spu_rawbody_ok(b->fn, ls)) return 0;
@@ -2206,7 +2232,9 @@ static SpuBodyFn spu_resolve(uint32_t pc, const uint8_t* ls){
               if(!f&&ns<64){ seen[ns][0]=i; seen[ns][1]=pc; ns++;
                   fprintf(stderr,"[SPU-RES] %lu body#%u entry=0x%x pc=0x%x\n",
                           (unsigned long)GetTickCount(),i,g_spu_bodies[i].entry,pc); } }
-            if (g_spu_bodies[i].entry==0x4c00 && getenv("PS3_FSPAC")){
+            static int fspac=-1;
+            if (fspac<0) fspac=getenv("PS3_FSPAC")?1:0;
+            if (g_spu_bodies[i].entry==0x4c00 && fspac){
                 static volatile long njd; long k=InterlockedIncrement(&njd);
                 if (k<=512 || (k%64)==0){
                     const uint8_t* a=ls+0x80;
@@ -2713,6 +2741,13 @@ static uint32_t gcm_ioff2ea(uint32_t o){
         if(o>=g_gcmio[i].io && o<g_gcmio[i].io+g_gcmio[i].size) return g_gcmio[i].ea+(o-g_gcmio[i].io);
     return 0;
 }
+static uint32_t gcm_ioff2ea_run(uint32_t o, uint32_t* run){
+    if(o<gcm_cb_size){ *run=gcm_cb_size-o; return gcm_cb_ea+o; }
+    for(int i=0;i<g_ngcmio;i++)
+        if(o>=g_gcmio[i].io && o<g_gcmio[i].io+g_gcmio[i].size){
+            *run=g_gcmio[i].io+g_gcmio[i].size-o; return g_gcmio[i].ea+(o-g_gcmio[i].io); }
+    *run=0; return 0;
+}
 static void gcm_iomap_add(uint32_t ea, uint32_t io, uint32_t size){
     for(int i=0;i<g_ngcmio;){
         int ov_ea = g_gcmio[i].ea < ea+size && ea < g_gcmio[i].ea+g_gcmio[i].size;
@@ -2861,6 +2896,18 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
     int hot = 0;
     int hot_win = 512;
     { const char* e = getenv("PS3_GCM_HOT"); if(e){ int v=atoi(e); if(v>=0&&v<=100000) hot_win=v; } }
+    uint32_t tick_us = 500, vb_spin_us = 700;
+    { const char* e = getenv("PS3_GCM_TICK_US"); if(e){ int v=atoi(e); if(v>=50&&v<=16000) tick_us=(uint32_t)v; }
+      e = getenv("PS3_GCM_VBSPIN_US"); if(e){ int v=atoi(e); if(v>=0&&v<=4000) vb_spin_us=(uint32_t)v; } }
+    HANDLE wait_tmr = getenv("PS3_GCM_TICK") ? NULL
+        : CreateWaitableTimerExW(NULL, NULL, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,
+                                 TIMER_ALL_ACCESS);
+    HANDLE wait_evt = CreateEventW(NULL, FALSE, FALSE, NULL);
+    spu_fifo_watch_event(wait_evt);
+    int acq_spin = 256, stall_hot = 8;
+    { const char* e = getenv("PS3_GCM_ACQSPIN"); if(e){ int v=atoi(e); if(v>=0&&v<=1000000) acq_spin=v; }
+      e = getenv("PS3_GCM_STALLHOT"); if(e){ int v=atoi(e); if(v>=0&&v<=100000) stall_hot=v; } }
+    uint32_t park_ea = 0, park_val = 0; int park_acq = 0;
     enum { FW_GAME, FW_ACQ, FW_JTS };
     int fw_kind = FW_GAME;
     uint64_t fa_busy=0, fa_acq=0, fa_jts=0, fa_game=0, fa_vsync=0;
@@ -2870,7 +2917,19 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
     for(;;){
         { LARGE_INTEGER qa,qb; QueryPerformanceCounter(&qa);
           if(hot > 0){ hot--; SwitchToThread(); }
-          else Sleep(tick_ms);
+          else if(!wait_tmr) Sleep(tick_ms);
+          else {
+              long long left_us = (last_vb_q + vb_period - qa.QuadPart) * 1000000 / qpf.QuadPart;
+              if(left_us <= (long long)vb_spin_us) SwitchToThread();
+              else {
+                  long long w = left_us - vb_spin_us;
+                  if(w > (long long)tick_us) w = tick_us;
+                  LARGE_INTEGER due; due.QuadPart = -w * 10;
+                  SetWaitableTimer(wait_tmr, &due, 0, NULL, NULL, FALSE);
+                  HANDLE hs[2] = { wait_evt, wait_tmr };
+                  WaitForMultipleObjects(2, hs, FALSE, INFINITE);
+              }
+          }
           QueryPerformanceCounter(&qb);
           uint64_t dw=(uint64_t)(qb.QuadPart-qa.QuadPart);
           if(gcm_flip_pending) fa_vsync+=dw;
@@ -2892,6 +2951,8 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
                 int stall_kind=FW_JTS;
                 DWORD drain_t0=GetTickCount(); uint32_t drain_o0=get;
                 uint32_t o=get, callret=0; int guard=0, stalled=0;
+                uint64_t acq_spin_q=0;
+                park_ea=0;
                 static uint32_t sem_off;
                 static uint32_t stall_hdr; static DWORD stall_since;
                 static uint32_t jts_off; static DWORD jts_since;
@@ -2918,7 +2979,7 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
                         if(tgt==o){
                             DWORD nowj=GetTickCount();
                             if(jts_off!=o){ jts_off=o; jts_since=nowj; }
-                            if(nowj-jts_since<1000){ stalled=1; break; }
+                            if(nowj-jts_since<1000){ stalled=1; park_ea=cea; park_val=w; park_acq=0; break; }
                             MTRC(MTRC_FIFO_STALL,1,o,0,nowj-jts_since,"JTS TIMEOUT");
                             static int njts; if(njts++<16)
                                 fprintf(stderr,"[GCM] JTS TIMEOUT at io=0x%x - skipping word\n",o);
@@ -2944,8 +3005,9 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
                             fprintf(stderr,"\n");
                         }
                     }
-                    for(uint32_t i=0;i<cnt && o!=put;i++,o+=4){
-                        uint32_t aea=gcm_ioff2ea(o); if(!aea) break;
+                    uint32_t aea=0, arun=0;
+                    for(uint32_t i=0;i<cnt && o!=put;i++,o+=4,aea+=4,arun-=4){
+                        if(arun<4){ aea=gcm_ioff2ea_run(o,&arun); if(!aea) break; }
                         uint32_t arg=PPU_LW(g_base,aea), m=mth+(ni?0:i*4);
                         if(m==0x050){ PPU_STW(g_base,gcm_ctrl_ea+8,arg); }
                         else if(m==0x064||m==0x1d6c) sem_off=arg;
@@ -2953,16 +3015,19 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
                             if(gcm_label_ea && sem_off<0x4000 &&
                                PPU_LW(g_base,gcm_label_ea+sem_off)!=arg){
                                 int ok=0;
-                                for(int sp=0; sp<8192; sp++){
+                                LARGE_INTEGER sq0, sq1; QueryPerformanceCounter(&sq0);
+                                for(int sp=0; sp<acq_spin; sp++){
                                     YieldProcessor();
                                     if(PPU_LW(g_base,gcm_label_ea+sem_off)==arg){ ok=1; break; }
                                 }
+                                QueryPerformanceCounter(&sq1); acq_spin_q+=(uint64_t)(sq1.QuadPart-sq0.QuadPart);
                                 if(ok) stall_hdr=0;
                                 if(!ok){
                                     uint32_t hdr=o-4u*(i+1u);
                                     DWORD now2=GetTickCount();
                                     if(stall_hdr!=hdr){ stall_hdr=hdr; stall_since=now2; }
-                                    if(now2-stall_since<250){ o=hdr; stalled=1; stall_kind=FW_ACQ; break; }
+                                    if(now2-stall_since<250){ o=hdr; stalled=1; stall_kind=FW_ACQ;
+                                        park_ea=gcm_label_ea+sem_off; park_val=arg; park_acq=1; break; }
                                     MTRC(MTRC_FIFO_STALL,0,sem_off,arg,
                                          GetTickCount()-stall_since,"acquire TIMEOUT");
                                     static int nsk; if(nsk++<40)
@@ -3022,8 +3087,17 @@ static DWORD WINAPI gcm_vblank_main(LPVOID p){
                             (unsigned long)GetTickCount(),(unsigned long)ddt,
                             drain_o0,newget,put,stalled,guard); }
                 if(newget != get) hot = hot_win;
+                if(stalled && park_ea && wait_tmr){
+                    spu_fifo_watch(park_ea);
+                    if(hot > stall_hot) hot = stall_hot;
+                    MemoryBarrier();
+                    uint32_t pv = PPU_LW(g_base,park_ea);
+                    if((park_acq ? pv == park_val : pv != park_val) && hot < 1) hot = 1;
+                } else spu_fifo_watch(0);
                 { LARGE_INTEGER qd1; QueryPerformanceCounter(&qd1);
                   uint64_t dd=(uint64_t)(qd1.QuadPart-qd0.QuadPart);
+                  uint64_t sp=acq_spin_q<dd?acq_spin_q:dd;
+                  dd-=sp; fa_acq+=sp;
                   fw_kind = stalled ? stall_kind : FW_GAME;
                   if(newget!=get) fa_busy+=dd;
                   else if(stall_kind==FW_ACQ) fa_acq+=dd; else fa_jts+=dd; }
@@ -4853,9 +4927,6 @@ static void ppu_syscall_body(PPUContext* ctx, uint8_t* base){
         uint64_t target = (uint64_t)s0.QuadPart + us * (uint64_t)f.QuadPart / 1000000ull;
         static int uspin=-1; if(uspin<0) uspin=getenv("PS3_USLEEP_SPIN")?1:0;
         if(!uspin && us>=50){
-#ifndef CREATE_WAITABLE_TIMER_HIGH_RESOLUTION
-#define CREATE_WAITABLE_TIMER_HIGH_RESOLUTION 0x00000002
-#endif
             static __declspec(thread) HANDLE ht; static volatile long hr_fail;
             if(!ht && !hr_fail){
                 ht=CreateWaitableTimerExW(0,0,CREATE_WAITABLE_TIMER_HIGH_RESOLUTION,TIMER_ALL_ACCESS);

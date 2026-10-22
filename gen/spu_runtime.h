@@ -234,7 +234,7 @@ extern const SpuBody g_spu_bodies[];
 extern const unsigned g_spu_nbodies;
 void spu_interp(SPUContext* c);
 int spu_reloc_hit(uint32_t pc, const uint8_t* ls);
-typedef struct { void (*fn)(SPUContext*); uint32_t ea; } SpuJobGuest;
+typedef struct { void (*fn)(SPUContext*); uint32_t ea, code_end; } SpuJobGuest;
 extern const SpuJobGuest g_spu_job_guest[];
 extern const unsigned    g_spu_njob_guest;
 int spu_jobbody_verify(void (*fn)(SPUContext*), const uint8_t* ls, uint32_t base);
@@ -244,6 +244,8 @@ void        spu_set_intr_hook(int (*h)(SpuThread* t, uint32_t intr, uint32_t dat
 void        spu_rt_set_mainmem(uint8_t* base, uint64_t size);
 void        spu_set_dma_read_hook(void (*h)(uint32_t ea, uint32_t sz),
                                   uint32_t lo, uint32_t hi);
+void        spu_fifo_watch(uint32_t ea);
+void        spu_fifo_watch_event(void* evt);
 SpuThread*  spu_thread_create(void (*run)(SPUContext*), const uint8_t* image,
                               uint32_t img_lsaddr, uint32_t img_size, uint32_t entry);
 void        spu_thread_join(SpuThread* t);

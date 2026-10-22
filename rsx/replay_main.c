@@ -751,6 +751,7 @@ static void load_state(const FrameView* v){
         rsx_set_display_buffer(i, d->offset, d->pitch, d->width, d->height);
     }
     memcpy(&g_rsx, v->st, sizeof g_rsx);
+    g_vp_instr_epoch++;
 }
 
 static int goto_frame(uint32_t k){
@@ -898,6 +899,7 @@ int main(int argc, char** argv){
                                    base_disp[i].width, base_disp[i].height);
         }
     memcpy(&g_rsx, base_st, sizeof g_rsx);
+    g_vp_instr_epoch++;
 
     if(!v2){
         if(!getenv("PS3_RSXSHOT")) _putenv("PS3_RSXSHOT=1");

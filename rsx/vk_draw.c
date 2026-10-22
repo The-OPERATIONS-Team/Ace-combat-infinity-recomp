@@ -54,11 +54,15 @@ static VkFence g_fence;
 #define NCMD 8
 static VkCommandBuffer g_cmds[NCMD]; static VkFence g_fences[NCMD];
 static int g_cmdi, g_inflight[NCMD];
+static uint64_t g_cmd_seq[NCMD], g_cmd_nsub;
 #define NFRAME 2
 static int g_fslot;
 static int g_frame_last_cmd[2]={-1,-1};
+static uint64_t g_frame_last_seq[2];
+static VkPipeline g_pipe_dead[2][128]; static int g_ndead[2];
 static uint32_t g_vend, g_iend, g_uend, g_tend;
 static int g_tstaged;
+static int g_tstage_slot=-1; static uint64_t g_tstage_seq;
 #define NQUERY 512
 static VkQueryPool g_qpool;
 static int g_up=0;
@@ -170,6 +174,7 @@ static uint8_t* g_wbptr[WB_SLOTS];
 static WbEnt    g_wbent[WB_SLOTS][WB_MAX];
 static int      g_wbn[WB_SLOTS];
 static int      g_wbcmd[WB_SLOTS];
+static uint64_t g_wbseq[WB_SLOTS];
 static int      g_wbslot;
 static uint32_t* g_texscratch;
 typedef struct { uint64_t key; VkSampler s; } Samp;
@@ -200,6 +205,10 @@ extern RsxState g_rsx;
 static uint64_t fnv1a(const void* p, size_t n, uint64_t h){
     const uint8_t* b=p;
     for(size_t i=0;i<n;i++){ h^=b[i]; h*=0x100000001b3ull; }
+    return h;
+}
+static uint64_t hash_u32s(const uint32_t* p, size_t n, uint64_t h){
+    for(size_t i=0;i<n;i++){ h=(h^p[i])*0xff51afd7ed558ccdull; h^=h>>29; }
     return h;
 }
 static uint32_t f2u(float f){ uint32_t u; memcpy(&u,&f,4); return u; }
@@ -609,7 +618,7 @@ static void cmd_submit_ex(int wait){
     VkSubmitInfo si={.sType=VK_STRUCTURE_TYPE_SUBMIT_INFO,
         .commandBufferCount=1,.pCommandBuffers=&g_cmd};
     vkQueueSubmit(g_q,1,&si,g_fences[g_cmdi]);
-    g_inflight[g_cmdi]=1;
+    g_inflight[g_cmdi]=1; g_cmd_seq[g_cmdi]=++g_cmd_nsub;
     g_cmd_open=0; g_cur=0;
     if(wait){
         cmd_retire(g_cmdi);
@@ -620,10 +629,18 @@ static void cmd_submit_ex(int wait){
 }
 static void cmd_submit(void){ cmd_submit_ex(1); }
 static void cmd_flush(void){  cmd_submit_ex(0); }
+static void cmd_retire_seq(int slot, uint64_t seq){
+    if(slot>=0&&g_inflight[slot]&&g_cmd_seq[slot]==seq) cmd_retire(slot);
+}
+static void tstage_settle(void){
+    if(g_tstage_slot<0) return;
+    cmd_retire_seq(g_tstage_slot,g_tstage_seq);
+    g_tstage_slot=-1;
+}
 
 static void wb_drain(int slot, int dump){
     if(!g_wbn[slot] || g_wbcmd[slot] < 0){ g_wbn[slot]=0; g_wbcmd[slot]=-1; return; }
-    cmd_retire(g_wbcmd[slot]);
+    cmd_retire_seq(g_wbcmd[slot],g_wbseq[slot]);
     for(int k=0;k<g_wbn[slot];k++){
         const WbEnt* e=&g_wbent[slot][k];
         if(!e->isf){
@@ -921,30 +938,100 @@ static uint32_t g_fp_epoch=1;
 static uint32_t g_fp_memo_ea, g_fp_memo_epoch;
 static int      g_fp_memo_valid;
 
+#define FPC_N 512
+typedef struct {
+    uint32_t  key, ea, nwords, nins, nimm, cap;
+    uint64_t  khash;
+    uint8_t*  raw;
+    uint32_t* words;
+    uint32_t* ins;
+    uint32_t* imm;
+} FpCacheEnt;
+static FpCacheEnt  g_fpc[FPC_N];
+static FpCacheEnt* g_fpc_cur;
+
+static int fpc_reserve(FpCacheEnt* e, uint32_t nw){
+    if(nw<=e->cap) return 1;
+    uint32_t cap=nw<64?64:nw;
+    uint8_t* raw=(uint8_t*)realloc(e->raw,(size_t)cap*4);
+    if(raw) e->raw=raw;
+    uint32_t* w=(uint32_t*)realloc(e->words,(size_t)cap*4);
+    if(w) e->words=w;
+    uint32_t* in=(uint32_t*)realloc(e->ins,(size_t)cap*4);
+    if(in) e->ins=in;
+    uint32_t* im=(uint32_t*)realloc(e->imm,(size_t)cap*4);
+    if(im) e->imm=im;
+    if(!raw||!w||!in||!im) return 0;
+    e->cap=cap; return 1;
+}
+
 static int fetch_fp(void){
     if(g_fp_memo_valid&&g_fp_memo_ea==g_rsx.fp_offset_raw&&
        g_fp_memo_epoch==g_fp_epoch){ g_dpfpmemo++; return g_fp_nwords>0; }
     uint32_t loc=((g_rsx.fp_offset_raw&3)==2)?GCM_LOCATION_MAIN:GCM_LOCATION_LOCAL;
     uint32_t ea=resolve(g_rsx.fp_offset_raw&~3u,loc);
-    if(!ea){ g_fp_memo_valid=0; return 0; }
+    if(!ea){ g_fp_memo_valid=0; g_fpc_cur=0; return 0; }
+    uint32_t key=g_rsx.fp_offset_raw;
+    FpCacheEnt* e=&g_fpc[(key*2654435761u)>>23];
+    const uint8_t* src=g_base+ea;
+    if(e->nwords&&e->key==key&&e->ea==ea){
+        int same=memcmp(e->raw,src,(size_t)e->nwords*4)==0;
+        if(!same){
+            same=1;
+            for(uint32_t i=0;i<e->nins&&same;i++)
+                same=memcmp(e->raw+e->ins[i]*4,src+e->ins[i]*4,16)==0;
+            if(same)
+                for(uint32_t i=0;i<e->nimm;i++){
+                    uint32_t c=e->imm[i];
+                    for(int k=0;k<4;k++) e->words[c+k]=fp_word(src+(c+k)*4);
+                    memcpy(e->raw+c*4,src+c*4,16);
+                }
+        }
+        if(same){
+            memcpy(g_fp_words,e->words,(size_t)e->nwords*4);
+            g_fp_nwords=e->nwords; g_fp_khash=e->khash; g_fpc_cur=e;
+            g_fp_memo_ea=key; g_fp_memo_epoch=g_fp_epoch; g_fp_memo_valid=1;
+            return 1;
+        }
+    }
     uint32_t maxw=sizeof g_fp_words/4;
-    uint32_t iw=0;
+    uint32_t iw=0, nins=0, nimm=0;
+    static uint32_t ins[16384/4], imm[16384/4];
     uint64_t kh=0xcbf29ce484222325ull;
     while(iw+4<=maxw){
         for(int k=0;k<4;k++) g_fp_words[iw+k]=fp_word(g_base+ea+(iw+k)*4);
         FpInstr tmp;
         int used=fp_decode_instr(&g_fp_words[iw],&tmp);
-        if(used==2&&iw+8<=maxw)
+        if(used==2&&iw+8>maxw) used=1;
+        if(used==2)
             for(int k=4;k<8;k++) g_fp_words[iw+k]=fp_word(g_base+ea+(iw+k)*4);
+        ins[nins++]=iw;
+        if(used==2) imm[nimm++]=iw+4;
         kh=fnv1a(&g_fp_words[iw],16,kh);
         iw+=(uint32_t)used*4;
         if(tmp.end) break;
     }
     g_fp_nwords=iw;
     g_fp_khash=kh;
-    g_fp_memo_ea=g_rsx.fp_offset_raw; g_fp_memo_epoch=g_fp_epoch;
+    g_fp_memo_ea=key; g_fp_memo_epoch=g_fp_epoch;
     g_fp_memo_valid=1;
+    g_fpc_cur=0;
+    if(iw&&fpc_reserve(e,iw)){
+        e->key=key; e->ea=ea; e->nwords=iw; e->nins=nins; e->nimm=nimm; e->khash=kh;
+        memcpy(e->raw,g_base+ea,(size_t)iw*4);
+        memcpy(e->words,g_fp_words,(size_t)iw*4);
+        memcpy(e->ins,ins,(size_t)nins*4);
+        memcpy(e->imm,imm,(size_t)nimm*4);
+        g_fpc_cur=e;
+    } else e->nwords=0;
     return iw>0;
+}
+static uint32_t fp_consts(float (*out)[4], uint32_t cap){
+    const FpCacheEnt* e=g_fpc_cur;
+    if(!e) return fp_collect_consts(g_fp_words,g_fp_nwords,out,cap);
+    uint32_t n=e->nimm<cap?e->nimm:cap;
+    for(uint32_t i=0;i<n;i++) memcpy(out[i],&g_fp_words[e->imm[i]],16);
+    return n;
 }
 
 static uint32_t attr_bytes(uint32_t type, uint32_t size);
@@ -1003,17 +1090,23 @@ static VkPipeline pipe_get(uint32_t prim, uint32_t attr_present_mask, int isf,
     DP_T0(t_key);
     uint64_t h=0xcbf29ce484222325ull ^ (isf?0x5aa5ull:0);
     uint32_t start=g_rsx.vp_start&0x1ff;
-    uint32_t nvp=0;
-    for(uint32_t i=start;i<512;i++){ nvp++;
-        if(g_rsx.vp_instr[i][3]&1) break; }
-    h=fnv1a(&g_rsx.vp_instr[start][0],(size_t)nvp*16,h);
+    static uint64_t vp_h; static uint32_t vp_n, vp_start=~0u, vp_epoch;
+    if(start!=vp_start||g_vp_instr_epoch!=vp_epoch){
+        uint32_t n=0;
+        for(uint32_t i=start;i<512;i++){ n++;
+            if(g_rsx.vp_instr[i][3]&1) break; }
+        vp_h=hash_u32s(&g_rsx.vp_instr[start][0],(size_t)n*4,0x9e3779b97f4a7c15ull);
+        vp_n=n; vp_start=start; vp_epoch=g_vp_instr_epoch;
+    }
+    uint32_t nvp=vp_n;
+    { uint32_t vw[2]={(uint32_t)vp_h,(uint32_t)(vp_h>>32)}; h=hash_u32s(vw,2,h); }
     DP_T1(DP_KEY,t_key);
     DP_T0(t_fp);
     int fp_ok=fetch_fp();
     DP_T1(DP_FP,t_fp);
     if(!fp_ok) return VK_NULL_HANDLE;
     DP_T0(t_key2);
-    h=fnv1a(&g_fp_khash,8,h);
+    { uint32_t kw[2]={(uint32_t)g_fp_khash,(uint32_t)(g_fp_khash>>32)}; h=hash_u32s(kw,2,h); }
     uint32_t st[23]={prim|(g_rsx.restart_en?0x100u:0u),attr_present_mask,
         g_rsx.blend_enable,g_rsx.blend_sfactor,
         g_rsx.blend_dfactor,g_rsx.blend_eq,g_rsx.depth_test,g_rsx.depth_func,
@@ -1026,11 +1119,13 @@ static VkPipeline pipe_get(uint32_t prim, uint32_t attr_present_mask, int isf,
         g_rsx.poly_offs_fill?f2u(g_rsx.poly_offs_scale):0,
         g_rsx.poly_offs_fill?f2u(g_rsx.poly_offs_bias):0};
     for(int a=0;a<16;a++) st[14]^=g_rsx.vtx[a].format*(uint32_t)(a*2654435761u+2246822519u);
-    h=fnv1a(st,sizeof st,h);
-    for(int u=0;u<16;u++){ h=fnv1a(&g_rsx.tex[u].control1,4,h);
-        uint32_t zf=tex_zfunc(u); h=fnv1a(&zf,4,h);
-        uint32_t lf=zf?(uint32_t)tex_filter_linear(u):0u; h=fnv1a(&lf,4,h);
-        uint32_t ty=(uint32_t)tex_target(u); h=fnv1a(&ty,4,h); }
+    h=hash_u32s(st,sizeof st/4,h);
+    uint32_t tk[64];
+    for(int u=0;u<16;u++){ tk[u*4]=g_rsx.tex[u].control1;
+        uint32_t zf=tex_zfunc(u); tk[u*4+1]=zf;
+        tk[u*4+2]=zf?(uint32_t)tex_filter_linear(u):0u;
+        tk[u*4+3]=(uint32_t)tex_target(u); }
+    h=hash_u32s(tk,64,h);
     uint32_t buck=(uint32_t)h&(NPIPEBUCK-1);
     for(int s=g_pipe_head[buck]; s; s=g_pipe[s-1].next){
         Pipe* p=&g_pipe[s-1];
@@ -1570,6 +1665,7 @@ static Tex* tex_get(uint32_t unit){
                         failed=1; break; }
                     cmd_submit(); g_toff=0; cmd_begin();
                 }
+                tstage_settle();
                 memcpy(g_tptr+g_toff,g_texscratch,ln); g_tstaged=1;
                 VkBufferImageCopy lb={.bufferOffset=g_toff,
                     .imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,lev,
@@ -1704,6 +1800,7 @@ static VkImageView vtex_get(uint32_t unit){
             fprintf(stderr,"[RSXD] vtex %ux%u exceeds the staging buffer\n",w,h);
             return 0; }
     }
+    tstage_settle();
     float* dst=(float*)(g_tptr+g_toff); g_tstaged=1;
     for(uint32_t y=0;y<h;y++) for(uint32_t x2=0;x2<w;x2++){
         const uint8_t* pxl=g_base+ea+y*pitch+x2*bpp;
@@ -1899,6 +1996,32 @@ static void attr_fetch_one_native(const AttrFetch* f, uint32_t vi, uint8_t* out)
                                         out[i+2]=p[i+1]; out[i+3]=p[i]; } break;
     case 2: for(uint32_t i=0;i<n;i+=2){ out[i]=p[i+1]; out[i+1]=p[i]; } break;
     default: memcpy(out,p,n); break;
+    }
+}
+static void attr_fetch_native_run(const AttrFetch* f, const uint32_t* vord, uint32_t nv,
+                                  uint32_t vmax, uint8_t* dst){
+    uint32_t n=f->abytes, ds=f->dststride, freq=f->freq;
+    uint32_t top=vmax;
+    if(freq) top=f->modulo?(vmax<freq-1?vmax:freq-1):vmax/freq;
+    if(n!=ds||(f->limit&&f->base+(size_t)top*f->stride+n>f->limit)){
+        for(uint32_t k=0;k<nv;k++) attr_fetch_one_native(f,vord[k],dst+(size_t)k*ds);
+        return;
+    }
+    const uint8_t* base=f->base; uint32_t stride=f->stride;
+    for(uint32_t k=0;k<nv;k++){
+        uint32_t vi=vord[k];
+        if(freq) vi=f->modulo?vi%freq:vi/freq;
+        const uint8_t* p=base+(size_t)vi*stride;
+        uint8_t* o=dst+(size_t)k*ds;
+        if(f->swap==4){
+            for(uint32_t i=0;i<n;i+=4){ uint32_t w; memcpy(&w,p+i,4);
+                w=__builtin_bswap32(w); memcpy(o+i,&w,4); }
+        } else if(f->swap==2){
+            uint32_t i=0;
+            for(;i+4<=n;i+=4){ uint32_t w; memcpy(&w,p+i,4);
+                w=((w&0x00ff00ffu)<<8)|((w>>8)&0x00ff00ffu); memcpy(o+i,&w,4); }
+            if(i<n){ uint16_t s; memcpy(&s,p+i,2); s=__builtin_bswap16(s); memcpy(o+i,&s,2); }
+        } else memcpy(o,p,n);
     }
 }
 
@@ -2335,8 +2458,7 @@ void rsxd_end(void){
         if(!ok){
             memset(dst,0,(size_t)need);
         } else if(af.native){
-            for(uint32_t k=0;k<nuniq;k++)
-                attr_fetch_one_native(&af,vord[k],dst+(size_t)k*af.dststride);
+            attr_fetch_native_run(&af,vord,nuniq,vmax,dst);
         } else {
             for(uint32_t k=0;k<nuniq;k++)
                 attr_fetch_one(&af,vord[k],(float*)(dst+(size_t)k*16));
@@ -2390,8 +2512,7 @@ void rsxd_end(void){
     uint32_t fpcoff=uoff, fpcsz=16;
     if(nfpc){
         static float fpc[4096][4];
-        uint32_t n=fp_collect_consts(g_fp_words,g_fp_nwords,fpc,
-                                     (uint32_t)(sizeof fpc/sizeof fpc[0]));
+        uint32_t n=fp_consts(fpc,(uint32_t)(sizeof fpc/sizeof fpc[0]));
         if(n!=nfpc){ static int wn6; if(wn6++<8)
             fprintf(stderr,"[RSXD] fp constants: collected %u, module wants %u "
                     "- the two ucode walks disagree\n",n,nfpc); }
@@ -2586,6 +2707,7 @@ void rsxd_end(void){
             stages_for(b4.dstAccessMask,0),0,0,0,0,0,1,&b4);
           VkBufferImageCopy bic2={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
               .imageExtent={rt->w,rt->h,1}};
+          tstage_settle();
           vkCmdCopyImageToBuffer(g_cmd,rt->img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
               g_tbuf,1,&bic2);
           b4.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
@@ -2994,6 +3116,7 @@ static void snap_surface_bmp(Surf* sf, const char* path){
             stages_for(b.dstAccessMask,0),0,0,0,0,0,1,&b);
     VkBufferImageCopy bic={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
         .imageExtent={sf->w,sf->h,1}};
+    tstage_settle();
     vkCmdCopyImageToBuffer(g_cmd,sf->img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
         g_tbuf,1,&bic);
     sf->layout=2;
@@ -3078,6 +3201,7 @@ int rsxd_flip_present(uint32_t disp_ea, uint32_t w, uint32_t h){
     int r=rsxd_flip_present_inner(disp_ea,w,h);
     if(g_nretired){
         cmd_submit();
+        cmd_retire(g_cmdi);
         for(int i=0;i<g_nretired;i++) vkDestroyPipeline(g_dev,g_pipe_retired[i],NULL);
         g_nretired=0;
     }
@@ -3141,10 +3265,21 @@ static int rsxd_flip_present_inner(uint32_t disp_ea, uint32_t w, uint32_t h){
     if(g_up<=0) return 0;
     cmd_flush();
     g_frame_last_cmd[g_fslot]=g_cmdi;
+    g_frame_last_seq[g_fslot]=g_cmd_seq[g_cmdi];
+    { int ws=(g_wbslot+WB_SLOTS-1)%WB_SLOTS;
+      if(g_wbn[ws]&&g_wbcmd[ws]>=0) g_wbseq[ws]=g_cmd_seq[g_wbcmd[ws]]; }
+    for(int i=0;i<g_nretired;i++){
+        if(g_ndead[g_fslot]<(int)(sizeof g_pipe_dead[0]/sizeof g_pipe_dead[0][0]))
+            g_pipe_dead[g_fslot][g_ndead[g_fslot]++]=g_pipe_retired[i];
+        else { cmd_retire(g_cmdi); vkDestroyPipeline(g_dev,g_pipe_retired[i],NULL); }
+    }
+    g_nretired=0;
     g_fslot=(g_fslot+1)%NFRAME;
     { DP_T0(t_rt);
-      if(g_frame_last_cmd[g_fslot]>=0) cmd_retire(g_frame_last_cmd[g_fslot]);
+      cmd_retire_seq(g_frame_last_cmd[g_fslot],g_frame_last_seq[g_fslot]);
       if(dprof_on()) g_dpflip_retire+=dp_now()-t_rt; }
+    for(int i=0;i<g_ndead[g_fslot];i++) vkDestroyPipeline(g_dev,g_pipe_dead[g_fslot][i],NULL);
+    g_ndead[g_fslot]=0;
     vkResetDescriptorPool(g_dev,g_dpools[g_fslot],0);
     g_dpool=g_dpools[g_fslot];
     { uint32_t vseg=VBUF_CAP/NFRAME, iseg=IBUF_CAP/NFRAME, useg=UBUF_CAP/NFRAME;
@@ -3152,7 +3287,7 @@ static int rsxd_flip_present_inner(uint32_t disp_ea, uint32_t w, uint32_t h){
       g_ioff=(uint32_t)g_fslot*iseg; g_iend=g_ioff+iseg;
       g_uoff=(uint32_t)g_fslot*useg; g_uend=g_uoff+useg; }
     g_vpc_valid=0; dset_cache_drop();
-    if(g_tstaged){ cmd_retire(g_cmdi); g_tstaged=0; }
+    if(g_tstaged){ g_tstage_slot=g_cmdi; g_tstage_seq=g_cmd_seq[g_cmdi]; g_tstaged=0; }
     g_toff=0; g_tend=TBUF_CAP;
     Surf* s=0;
     for(int sl=g_surfhead[surf_hkey(disp_ea)]; sl; sl=g_surf[sl-1].hnext){
@@ -3212,6 +3347,7 @@ static int rsxd_flip_present_inner(uint32_t disp_ea, uint32_t w, uint32_t h){
             stages_for(b3.dstAccessMask,0),0,0,0,0,0,1,&b3);
               VkBufferImageCopy bic={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
                   .imageExtent={sf->w,sf->h,1}};
+              tstage_settle();
               vkCmdCopyImageToBuffer(g_cmd,sf->img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   g_tbuf,1,&bic);
               sf->layout=2;
@@ -3242,6 +3378,7 @@ static int rsxd_flip_present_inner(uint32_t disp_ea, uint32_t w, uint32_t h){
             stages_for(zb2.dstAccessMask,0),0,0,0,0,0,1,&zb2);
               VkBufferImageCopy zc2={.imageSubresource={VK_IMAGE_ASPECT_DEPTH_BIT,0,0,1},
                   .imageExtent={sf->w,sf->h,1}};
+              tstage_settle();
               vkCmdCopyImageToBuffer(g_cmd,sf->z,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   g_tbuf,1,&zc2);
               zb2.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;
@@ -3283,6 +3420,7 @@ static int rsxd_flip_present_inner(uint32_t disp_ea, uint32_t w, uint32_t h){
             stages_for(b2.dstAccessMask,0),0,0,0,0,0,1,&b2);
               VkBufferImageCopy bic={.imageSubresource={VK_IMAGE_ASPECT_COLOR_BIT,0,0,1},
                   .imageExtent={s->w,s->h,1}};
+              tstage_settle();
               vkCmdCopyImageToBuffer(g_cmd,s->img,VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
                   g_tbuf,1,&bic);
               b2.srcAccessMask=VK_ACCESS_TRANSFER_READ_BIT;

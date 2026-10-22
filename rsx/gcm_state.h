@@ -100,3 +100,4 @@ typedef struct {
 extern RsxState g_rsx;
 
 extern uint32_t g_vp_const_epoch;
+extern uint32_t g_vp_instr_epoch;

@@ -489,6 +489,9 @@ static int cap_take_request(void){
         g_frames_left = g_reqframes;
         return 1;
     }
+    { static DWORD last; DWORD now = GetTickCount();
+      if(now - last < 500) return 0;
+      last = now; }
     FILE* mk = fopen("capture.on", "rb");
     if(!mk) return 0;
     char buf[32] = {0};

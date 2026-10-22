@@ -59,6 +59,18 @@ set_source_files_properties(
   spu_body_spu_job_c91780_s14000.c
   spu_body_spu_job_d1cd00_s37600.c
   spu_body_spu_job_ca3480_s1e800.c
+  spu_body_spu_job_c91780_s15400.c
+  spu_body_spu_job_ca3480_s24c00.c
+  spu_body_spu_job_ca3480_s25000.c
+  spu_body_spu_job_cb0f00_s5c00.c
+  spu_body_spu_job_cb0f00_s17000.c
+  spu_body_spu_job_ca3480_s16c00.c
+  spu_body_spu_job_ca3480_s1ec00.c
+  spu_body_spu_job_ca3480_s1f000.c
+  spu_body_spu_job_cb0f00_s1a800.c
+  spu_body_spu_job_cb0f00_s1cc00.c
+  spu_body_spu_job_c91780_s2c800.c
+  spu_body_spu_job_c91780_s2cc00.c
   PROPERTIES COMPILE_OPTIONS "-O2")
 add_executable(game
   ppc_main.c
@@ -149,6 +161,18 @@ add_executable(game
   spu_body_spu_job_c91780_s14000.c
   spu_body_spu_job_d1cd00_s37600.c
   spu_body_spu_job_ca3480_s1e800.c
+  spu_body_spu_job_c91780_s15400.c
+  spu_body_spu_job_ca3480_s24c00.c
+  spu_body_spu_job_ca3480_s25000.c
+  spu_body_spu_job_cb0f00_s5c00.c
+  spu_body_spu_job_cb0f00_s17000.c
+  spu_body_spu_job_ca3480_s16c00.c
+  spu_body_spu_job_ca3480_s1ec00.c
+  spu_body_spu_job_ca3480_s1f000.c
+  spu_body_spu_job_cb0f00_s1a800.c
+  spu_body_spu_job_cb0f00_s1cc00.c
+  spu_body_spu_job_c91780_s2c800.c
+  spu_body_spu_job_c91780_s2cc00.c
   spu_reloc_imgs.c
   spu_bodies.c
   ppc_func_000.c

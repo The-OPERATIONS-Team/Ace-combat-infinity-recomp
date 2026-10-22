@@ -113,6 +113,7 @@ A few environment variables you might want:
 | `PS3_FS_ROOT` | The game's `USRDIR` folder |
 | `PS3_FUEL` | Sortie tickets granted per refill (default 6). `0` turns the offline fuel patch off |
 | `PS3_AUDIO_VOL` | Master volume, default `1.0` |
+| `PS3_PRESENT` | `fifo` waits for your monitor's vsync. The default is `mailbox` when the driver offers it |
 | `PS3_PROF=1` | Enables the profiler. F7 starts and stops a recording, written to `out/` |
 
 F8 writes a full state snapshot to `out/` and F9 starts or stops a gameplay capture that `rsxreplay` can play back. Both are for debugging.

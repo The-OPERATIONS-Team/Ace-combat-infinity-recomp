@@ -249,6 +249,54 @@ extern void spu_job_ca3480_s1e800(SPUContext*);
 extern const uint32_t spu_job_ca3480_s1e800_range[2];
 extern const uint32_t spu_job_ca3480_s1e800_sigat;
 extern const uint8_t spu_job_ca3480_s1e800_sig[16];
+extern void spu_job_c91780_s15400(SPUContext*);
+extern const uint32_t spu_job_c91780_s15400_range[2];
+extern const uint32_t spu_job_c91780_s15400_sigat;
+extern const uint8_t spu_job_c91780_s15400_sig[16];
+extern void spu_job_ca3480_s24c00(SPUContext*);
+extern const uint32_t spu_job_ca3480_s24c00_range[2];
+extern const uint32_t spu_job_ca3480_s24c00_sigat;
+extern const uint8_t spu_job_ca3480_s24c00_sig[16];
+extern void spu_job_ca3480_s25000(SPUContext*);
+extern const uint32_t spu_job_ca3480_s25000_range[2];
+extern const uint32_t spu_job_ca3480_s25000_sigat;
+extern const uint8_t spu_job_ca3480_s25000_sig[16];
+extern void spu_job_cb0f00_s5c00(SPUContext*);
+extern const uint32_t spu_job_cb0f00_s5c00_range[2];
+extern const uint32_t spu_job_cb0f00_s5c00_sigat;
+extern const uint8_t spu_job_cb0f00_s5c00_sig[16];
+extern void spu_job_cb0f00_s17000(SPUContext*);
+extern const uint32_t spu_job_cb0f00_s17000_range[2];
+extern const uint32_t spu_job_cb0f00_s17000_sigat;
+extern const uint8_t spu_job_cb0f00_s17000_sig[16];
+extern void spu_job_ca3480_s16c00(SPUContext*);
+extern const uint32_t spu_job_ca3480_s16c00_range[2];
+extern const uint32_t spu_job_ca3480_s16c00_sigat;
+extern const uint8_t spu_job_ca3480_s16c00_sig[16];
+extern void spu_job_ca3480_s1ec00(SPUContext*);
+extern const uint32_t spu_job_ca3480_s1ec00_range[2];
+extern const uint32_t spu_job_ca3480_s1ec00_sigat;
+extern const uint8_t spu_job_ca3480_s1ec00_sig[16];
+extern void spu_job_ca3480_s1f000(SPUContext*);
+extern const uint32_t spu_job_ca3480_s1f000_range[2];
+extern const uint32_t spu_job_ca3480_s1f000_sigat;
+extern const uint8_t spu_job_ca3480_s1f000_sig[16];
+extern void spu_job_cb0f00_s1a800(SPUContext*);
+extern const uint32_t spu_job_cb0f00_s1a800_range[2];
+extern const uint32_t spu_job_cb0f00_s1a800_sigat;
+extern const uint8_t spu_job_cb0f00_s1a800_sig[16];
+extern void spu_job_cb0f00_s1cc00(SPUContext*);
+extern const uint32_t spu_job_cb0f00_s1cc00_range[2];
+extern const uint32_t spu_job_cb0f00_s1cc00_sigat;
+extern const uint8_t spu_job_cb0f00_s1cc00_sig[16];
+extern void spu_job_c91780_s2c800(SPUContext*);
+extern const uint32_t spu_job_c91780_s2c800_range[2];
+extern const uint32_t spu_job_c91780_s2c800_sigat;
+extern const uint8_t spu_job_c91780_s2c800_sig[16];
+extern void spu_job_c91780_s2cc00(SPUContext*);
+extern const uint32_t spu_job_c91780_s2cc00_range[2];
+extern const uint32_t spu_job_c91780_s2cc00_sigat;
+extern const uint8_t spu_job_c91780_s2cc00_sig[16];
 
 const SpuBody g_spu_bodies[] = {
   {0x818, spu_run_sre_a, spu_run_sre_a_range, &spu_run_sre_a_sigat, spu_run_sre_a_sig},
@@ -313,6 +361,18 @@ const SpuBody g_spu_bodies[] = {
   {0x14000, spu_job_c91780_s14000, spu_job_c91780_s14000_range, &spu_job_c91780_s14000_sigat, spu_job_c91780_s14000_sig},
   {0x37600, spu_job_d1cd00_s37600, spu_job_d1cd00_s37600_range, &spu_job_d1cd00_s37600_sigat, spu_job_d1cd00_s37600_sig},
   {0x1e800, spu_job_ca3480_s1e800, spu_job_ca3480_s1e800_range, &spu_job_ca3480_s1e800_sigat, spu_job_ca3480_s1e800_sig},
+  {0x15400, spu_job_c91780_s15400, spu_job_c91780_s15400_range, &spu_job_c91780_s15400_sigat, spu_job_c91780_s15400_sig},
+  {0x24c00, spu_job_ca3480_s24c00, spu_job_ca3480_s24c00_range, &spu_job_ca3480_s24c00_sigat, spu_job_ca3480_s24c00_sig},
+  {0x25000, spu_job_ca3480_s25000, spu_job_ca3480_s25000_range, &spu_job_ca3480_s25000_sigat, spu_job_ca3480_s25000_sig},
+  {0x5c00, spu_job_cb0f00_s5c00, spu_job_cb0f00_s5c00_range, &spu_job_cb0f00_s5c00_sigat, spu_job_cb0f00_s5c00_sig},
+  {0x17000, spu_job_cb0f00_s17000, spu_job_cb0f00_s17000_range, &spu_job_cb0f00_s17000_sigat, spu_job_cb0f00_s17000_sig},
+  {0x16c00, spu_job_ca3480_s16c00, spu_job_ca3480_s16c00_range, &spu_job_ca3480_s16c00_sigat, spu_job_ca3480_s16c00_sig},
+  {0x1ec00, spu_job_ca3480_s1ec00, spu_job_ca3480_s1ec00_range, &spu_job_ca3480_s1ec00_sigat, spu_job_ca3480_s1ec00_sig},
+  {0x1f000, spu_job_ca3480_s1f000, spu_job_ca3480_s1f000_range, &spu_job_ca3480_s1f000_sigat, spu_job_ca3480_s1f000_sig},
+  {0x1a800, spu_job_cb0f00_s1a800, spu_job_cb0f00_s1a800_range, &spu_job_cb0f00_s1a800_sigat, spu_job_cb0f00_s1a800_sig},
+  {0x1cc00, spu_job_cb0f00_s1cc00, spu_job_cb0f00_s1cc00_range, &spu_job_cb0f00_s1cc00_sigat, spu_job_cb0f00_s1cc00_sig},
+  {0x2c800, spu_job_c91780_s2c800, spu_job_c91780_s2c800_range, &spu_job_c91780_s2c800_sigat, spu_job_c91780_s2c800_sig},
+  {0x2cc00, spu_job_c91780_s2cc00, spu_job_c91780_s2cc00_range, &spu_job_c91780_s2cc00_sigat, spu_job_c91780_s2cc00_sig},
 };
 const unsigned g_spu_nbodies = sizeof g_spu_bodies / sizeof g_spu_bodies[0];
 
@@ -352,7 +412,7 @@ const SpuJobGuest g_spu_job_guest[] = {
   {spu_job_c27800, 0xc27800u},
   {spu_job_c47380, 0xc47380u},
   {spu_job_bfa000, 0xbfa000u},
-  {spu_job_c62580, 0xc62580u},
+  {spu_job_c62580, 0xc62580u, 0x2200},
   {spu_job_c91780, 0xc91780u},
   {spu_job_cb0f00, 0xcb0f00u},
   {spu_job_cb0f00_s1b400, 0xcb0f00u},
@@ -361,5 +421,17 @@ const SpuJobGuest g_spu_job_guest[] = {
   {spu_job_c91780_s14000, 0xc91780u},
   {spu_job_d1cd00_s37600, 0xd1cd00u},
   {spu_job_ca3480_s1e800, 0xca3480u},
+  {spu_job_c91780_s15400, 0xc91780u},
+  {spu_job_ca3480_s24c00, 0xca3480u},
+  {spu_job_ca3480_s25000, 0xca3480u},
+  {spu_job_cb0f00_s5c00, 0xcb0f00u},
+  {spu_job_cb0f00_s17000, 0xcb0f00u},
+  {spu_job_ca3480_s16c00, 0xca3480u},
+  {spu_job_ca3480_s1ec00, 0xca3480u},
+  {spu_job_ca3480_s1f000, 0xca3480u},
+  {spu_job_cb0f00_s1a800, 0xcb0f00u},
+  {spu_job_cb0f00_s1cc00, 0xcb0f00u},
+  {spu_job_c91780_s2c800, 0xc91780u},
+  {spu_job_c91780_s2cc00, 0xc91780u},
 };
 const unsigned g_spu_njob_guest = sizeof g_spu_job_guest / sizeof g_spu_job_guest[0];
